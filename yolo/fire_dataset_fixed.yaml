@@ -1,0 +1,7 @@
+names:
+- fire
+- smoke
+nc: 2
+test: C:\Users\Hp\OneDrive\Desktop\Army\server\yolo\fire_dataset\test\images
+train: C:\Users\Hp\OneDrive\Desktop\Army\server\yolo\fire_dataset\train\images
+val: C:\Users\Hp\OneDrive\Desktop\Army\server\yolo\fire_dataset\valid\images

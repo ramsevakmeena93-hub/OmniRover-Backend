@@ -1,0 +1,10 @@
+node_modules/
+.env
+yolo/fire_dataset/
+yolo/runs/
+yolo/smoke-fire-1/
+yolo/smoke-fire-dataset/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
