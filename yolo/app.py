@@ -1,7 +1,9 @@
 """
-OmniRover Detection Service
-- Model 1: yolov8n.pt -> humans, debris
-- Fire/Smoke: HSV color detection (no model needed, instant)
+OmniRover YOLO Detection Service
+Optimized for Render free tier (512MB RAM)
+- Lazy model loading (loads only when first frame arrives)
+- CPU-only torch
+- HSV color fire detection (no model needed)
 """
 import asyncio, base64, io, json, os
 import numpy as np
@@ -9,24 +11,32 @@ import cv2
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
-from ultralytics import YOLO
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 CONF = 0.20
 
-print("[OmniRover] Loading human detection model...")
-model_primary = YOLO("yolov8n.pt")
-print("[OmniRover] Ready")
+# Lazy-loaded models — only loaded when first frame arrives
+_model_primary = None
+_model_fire = None
+_models_loaded = False
 
-# Load fire model if available
-model_fire = None
-for p in ["fire_debris.pt", "fire_model.pt"]:
-    if os.path.exists(p):
-        model_fire = YOLO(p)
-        print(f"[OmniRover] Fire model loaded: {p} | classes: {model_fire.names}")
-        break
+def load_models():
+    global _model_primary, _model_fire, _models_loaded
+    if _models_loaded:
+        return
+    from ultralytics import YOLO
+    print("[OmniRover] Loading human detection model...")
+    _model_primary = YOLO("yolov8n.pt")
+    print("[OmniRover] Human model ready")
+    for p in ["fire_debris.pt", "fire_model.pt"]:
+        if os.path.exists(p):
+            _model_fire = YOLO(p)
+            print(f"[OmniRover] Fire model loaded: {p}")
+            break
+    _models_loaded = True
+    print("[OmniRover] All models ready")
 
 PRIMARY_MAP = {
     "person": "human",
@@ -37,7 +47,7 @@ PRIMARY_MAP = {
 
 FIRE_MAP = {
     "fire": "fire", "Fire": "fire", "smoke": "fire",
-    "Smoke": "fire", "flame": "fire", "2.": "fire",
+    "Smoke": "fire", "flame": "fire",
 }
 
 COLORS = {
@@ -49,13 +59,14 @@ COLORS = {
 
 
 def run_primary(img_np):
-    """Detect humans and debris using YOLOv8n"""
-    results = model_primary(img_np, verbose=False, conf=CONF)
+    if not _model_primary:
+        return [], {"human": False, "fire": False, "gas": False, "debris": False}
+    results = _model_primary(img_np, verbose=False, conf=CONF)
     dets, flags = [], {"human": False, "fire": False, "gas": False, "debris": False}
     for r in results:
         for box in r.boxes:
             conf = float(box.conf[0])
-            name = model_primary.names[int(box.cls[0])].lower()
+            name = _model_primary.names[int(box.cls[0])].lower()
             cat = PRIMARY_MAP.get(name)
             if not cat:
                 continue
@@ -70,15 +81,14 @@ def run_primary(img_np):
 
 
 def run_fire_model(img_np):
-    """Use trained fire model if available"""
-    if not model_fire:
+    if not _model_fire:
         return [], {"human": False, "fire": False, "gas": False, "debris": False}
-    results = model_fire(img_np, verbose=False, conf=CONF)
+    results = _model_fire(img_np, verbose=False, conf=CONF)
     dets, flags = [], {"human": False, "fire": False, "gas": False, "debris": False}
     for r in results:
         for box in r.boxes:
             conf = float(box.conf[0])
-            name = model_fire.names[int(box.cls[0])]
+            name = _model_fire.names[int(box.cls[0])]
             cat = FIRE_MAP.get(name) or FIRE_MAP.get(name.lower())
             if not cat:
                 if any(k in name.lower() for k in ["fire", "smoke", "flame"]):
@@ -96,34 +106,21 @@ def run_fire_model(img_np):
 
 
 def detect_fire_color(img_np):
-    """
-    HSV color-based fire & smoke detection.
-    Fire = bright orange/red/yellow pixels in clusters.
-    Smoke = large gray/white diffuse regions.
-    No model needed — works instantly.
-    """
+    """HSV color-based fire detection — no model, zero RAM cost"""
     dets = []
     flags = {"human": False, "fire": False, "gas": False, "debris": False}
     h_img, w_img = img_np.shape[:2]
     total_pixels = h_img * w_img
-
     try:
         hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
-
-        # ── FIRE: only very bright, saturated orange-red pixels ──────
-        # Tight range — must be highly saturated AND very bright (actual flame)
         fire_mask1 = cv2.inRange(hsv, np.array([0,  200, 200]), np.array([18, 255, 255]))
         fire_mask2 = cv2.inRange(hsv, np.array([165,200, 200]), np.array([180,255, 255]))
         fire_mask  = cv2.bitwise_or(fire_mask1, fire_mask2)
-
-        # Clean up noise
         k = np.ones((7, 7), np.uint8)
         fire_mask = cv2.morphologyEx(fire_mask, cv2.MORPH_OPEN, k)
         fire_mask = cv2.dilate(fire_mask, k, iterations=2)
-
         contours, _ = cv2.findContours(fire_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        min_fire_area = total_pixels * 0.012  # 1.2% of frame minimum
-
+        min_fire_area = total_pixels * 0.012
         for cnt in contours:
             area = cv2.contourArea(cnt)
             if area < min_fire_area:
@@ -132,38 +129,28 @@ def detect_fire_color(img_np):
             roi = img_np[y:y+bh, x:x+bw]
             if roi.size == 0:
                 continue
-            # Verify: fire must be very red AND bright AND more red than green
             mean_r = float(np.mean(roi[:, :, 0]))
             mean_g = float(np.mean(roi[:, :, 1]))
             mean_b = float(np.mean(roi[:, :, 2]))
-            # Strict checks: very bright red, red >> green, red >> blue
-            if mean_r < 180:
-                continue  # not bright enough
-            if mean_r < mean_g + 60:
-                continue  # not red/orange enough (skin tone has r~g)
-            if mean_b > 100:
-                continue  # too much blue (not fire)
+            if mean_r < 180 or mean_r < mean_g + 60 or mean_b > 100:
+                continue
             conf = min(0.93, (area / total_pixels) * 18)
             flags["fire"] = True
             dets.append({
                 "class": "fire", "label": "fire",
                 "confidence": round(conf, 3),
                 "bbox": [x, y, x + bw, y + bh],
-                "color": "#ff2d2d",
-                "source": "color"
+                "color": "#ff2d2d", "source": "color"
             })
-
-        # Smoke detection disabled — too many false positives indoors
-        # Enable only when rover is in outdoor/disaster environment
-        # s_contours = []
-
     except Exception as e:
         print(f"[COLOR] Error: {e}")
-
     return dets, flags
 
 
 def process_frame(b64: str):
+    # Load models lazily on first frame
+    load_models()
+
     img_bytes = base64.b64decode(b64)
     img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     img_np = np.array(img)
@@ -209,18 +196,23 @@ async def ws_endpoint(ws: WebSocket):
         print(f"[WS] Error: {e}")
 
 
+@app.get("/")
+def root():
+    return {"status": "OmniRover YOLO Service", "ws": "/ws", "health": "/health"}
+
+
 @app.get("/health")
 def health():
     return {
         "status": "ok",
+        "models_loaded": _models_loaded,
         "human_model": "yolov8n.pt",
-        "fire_model": model_fire is not None,
+        "fire_model": _model_fire is not None,
         "color_detection": True,
     }
 
 
 if __name__ == "__main__":
     import uvicorn
-    print("[OmniRover] ws://localhost:5001/ws")
-    print("[OmniRover] Fire detection: HSV color + YOLO (if model present)")
-    uvicorn.run(app, host="0.0.0.0", port=5001)
+    print("[OmniRover] Starting on port", int(os.environ.get("PORT", 5001)))
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 5001)))
