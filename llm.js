@@ -97,5 +97,64 @@ function getFallbackRecommendation(data) {
   return 'ZONE CLEAR: All sensors nominal. Continue systematic search pattern. Maintain current heading. Report status every 5 minutes.'
 }
 
-module.exports = { getLLMRecommendation }
+/**
+ * Vision LLM — send a camera frame to Llama 4 Scout (vision model)
+ * Returns a text description of what the camera sees
+ */
+async function getVisionDescription(base64Image) {
+  if (!GROQ_API_KEY) return "Vision API not configured — add GROQ_API_KEY to server/.env"
+
+  return new Promise((resolve) => {
+    const body = JSON.stringify({
+      model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+      messages: [{
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: 'You are an AI assistant for NDRF disaster rescue operations. Analyze this camera frame from a rescue rover. Describe in 2-3 sentences: what you see, any hazards (fire, smoke, debris, trapped persons), and immediate tactical recommendation. Be concise and military-style.'
+          },
+          {
+            type: 'image_url',
+            image_url: { url: `data:image/jpeg;base64,${base64Image}` }
+          }
+        ]
+      }],
+      max_tokens: 200,
+      temperature: 0.2,
+    })
+
+    const options = {
+      hostname: 'api.groq.com',
+      path: '/openai/v1/chat/completions',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${GROQ_API_KEY}`,
+        'Content-Length': Buffer.byteLength(body),
+      },
+    }
+
+    const req = https.request(options, (res) => {
+      let data = ''
+      res.on('data', chunk => data += chunk)
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(data)
+          const text = json.choices?.[0]?.message?.content?.trim()
+          resolve(text || 'Vision analysis unavailable.')
+        } catch {
+          resolve('Vision analysis failed — check API key.')
+        }
+      })
+    })
+
+    req.on('error', () => resolve('Vision service unreachable.'))
+    req.setTimeout(8000, () => { req.destroy(); resolve('Vision analysis timed out.') })
+    req.write(body)
+    req.end()
+  })
+}
+
+module.exports = { getLLMRecommendation, getVisionDescription }
 
