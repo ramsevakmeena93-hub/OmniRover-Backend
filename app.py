@@ -22,17 +22,24 @@ _model_primary = None
 _model_fire = None
 _models_loaded = False
 
+# Models are in yolo/ subfolder
+MODEL_DIR = os.path.join(os.path.dirname(__file__), "yolo")
+
 def load_models():
     global _model_primary, _model_fire, _models_loaded
     if _models_loaded:
         return
     from ultralytics import YOLO
     print("[OmniRover] Loading human detection model...")
-    _model_primary = YOLO("yolov8n.pt")
+    _model_primary = YOLO(os.path.join(MODEL_DIR, "yolov8n.pt"))
     print("[OmniRover] Human model ready")
     for p in ["fire_debris.pt", "fire_model.pt"]:
+        full = os.path.join(MODEL_DIR, p)
+        if os.path.exists(full):
+            p = full
         if os.path.exists(p):
             _model_fire = YOLO(p)
+            break
             print(f"[OmniRover] Fire model loaded: {p}")
             break
     _models_loaded = True
